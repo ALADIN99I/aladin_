@@ -87,6 +87,11 @@ class LiveTrader:
         self.initial_balance = 0.0
         self.last_cycle_time = 0
         self.cycle_count = 0  # Add cycle counter like simulation
+
+        # State tracking variables for alignment with simulation
+        self.trades_executed = []
+        self.portfolio_history = []
+        self.previous_ufo_data = None
         
         self._initialize_portfolio()
 
@@ -232,6 +237,32 @@ class LiveTrader:
             else:
                 logging.error(f"❌ Failed to close position {ticket}.")
 
+    def close_affected_positions(self, exit_signals):
+        """Closes positions affected by strong UFO exit signals."""
+        positions_closed = 0
+        currencies_to_close = {signal['currency'] for signal in exit_signals}
+
+        logging.info(f"Closing positions for affected currencies: {', '.join(currencies_to_close)}")
+
+        # We need to work with the live positions from the broker
+        open_positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
+        if open_positions_df is None or open_positions_df.empty:
+            logging.info("No open positions to check for closure.")
+            return 0
+
+        for _, position in open_positions_df.iterrows():
+            symbol = position['symbol'].replace('-ECN', '')
+            base_currency = symbol[:3]
+            quote_currency = symbol[3:6]
+
+            if base_currency in currencies_to_close or quote_currency in currencies_to_close:
+                logging.info(f"🚨 Closing position {position['ticket']} ({position['symbol']}) due to exit signal for {base_currency} or {quote_currency}.")
+                success = self.trade_executor.close_trade(position['ticket'])
+                if success:
+                    positions_closed += 1
+
+        return positions_closed
+
     def continuous_position_monitoring(self):
         """
         High-frequency monitoring of open positions with dynamic reinforcement.
@@ -258,7 +289,8 @@ class LiveTrader:
         logging.info(f"🚀 Starting New Trading Cycle at {datetime.now().strftime('%H:%M:%S')}")
         logging.info("="*60)
 
-        # 2. Data Collection for all symbols
+        # PHASE 1: Data Collection
+        logging.info("📊 PHASE 1: Data Collection")
         symbols = self.config['trading']['symbols'].split(',')
         symbol_suffix = self.config['mt5'].get('symbol_suffix', '')
         timeframes = [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4, mt5.TIMEFRAME_D1]
@@ -287,7 +319,8 @@ class LiveTrader:
             time.sleep(60)
             return
 
-        # 3. UFO Calculation - with robust data validation
+        # PHASE 2: UFO Analysis
+        logging.info("🛸 PHASE 2: UFO Analysis")
         reshaped_data = {}
         valid_data_count = 0
         
@@ -336,17 +369,15 @@ class LiveTrader:
             'coherence_analysis': coherence_analysis
         }
 
-        # Store UFO data for reinforcement analysis
-        self.last_ufo_data = enhanced_ufo_data
+        # The enhanced_ufo_data will be stored as previous_ufo_data at the end of the cycle for the next iteration.
         
-        # 4. First Priority: UFO Portfolio Management
+        # PHASE 5: UFO Portfolio Management
+        logging.info("💼 PHASE 5: UFO Portfolio Management")
         open_positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
         if open_positions_df is not None and not open_positions_df.empty:
             logging.info(f"\n--- UFO Portfolio Management: {len(open_positions_df)} positions ---")
-            
-            # Analyze all positions for reinforcement opportunities
-            self.analyze_positions_for_reinforcement()
 
+            # STEP 1: Check for portfolio-level stop
             account_info = self.mt5_collector.connect() and mt5.account_info()
             if account_info:
                 portfolio_stop_breached, stop_reason = self.ufo_engine.check_portfolio_equity_stop(
@@ -360,6 +391,7 @@ class LiveTrader:
                     time.sleep(300)
                     return
 
+            # STEP 2: Check for session end
             economic_events_for_session = self.agents['data_analyst'].execute({'source': 'economic_calendar'})
             should_close, close_reason = self.ufo_engine.should_close_for_session_end(economic_events_for_session)
             if should_close:
@@ -369,73 +401,58 @@ class LiveTrader:
                 time.sleep(300)
                 return
 
-            current_market_data = self.get_real_time_market_data_for_positions(open_positions_df)
-            for _, position in open_positions_df.iterrows():
-                should_reinforce, reason, reinforcement_plan = self.ufo_engine.should_reinforce_position(
-                    position, enhanced_ufo_data, current_market_data
-                )
-                
-                if should_reinforce:
-                    logging.info(f"🔧 UFO Compensation: {reason}")
-                    success, result_msg = self.ufo_engine.execute_compensation_trade(
-                        position, reinforcement_plan, self.trade_executor
-                    )
-                    if success:
-                        logging.info(f"✅ {result_msg}")
-                    else:
-                        logging.error(f"❌ Compensation failed: {result_msg}")
-                elif "close position" in reason:
-                    logging.info(f"📊 UFO Analysis: Closing {position.ticket} - {reason}")
-                    self.trade_executor.close_trade(position.ticket)
-                else:
-                    logging.info(f"📈 Position {position.ticket} - {reason}")
+            # STEP 3: Analyze for UFO exit signals
+            if self.previous_ufo_data and enhanced_ufo_data:
+                exit_signals = self.ufo_engine.analyze_ufo_exit_signals(enhanced_ufo_data, self.previous_ufo_data)
+                if exit_signals:
+                    logging.info(f"📈 UFO Exit Signals detected: {len(exit_signals)} currency changes")
+                    for signal in exit_signals:
+                        logging.info(f"   ⚠️ {signal['reason']} (change: {signal['change']:.2f})")
 
-        # 5. Agentic Workflow for new trade decisions
+                    if len(exit_signals) >= 3:
+                        logging.info("🚨 STRONG EXIT SIGNALS detected: Auto-closing affected positions")
+                        positions_closed = self.close_affected_positions(exit_signals)
+                        logging.info(f"🚨 Auto-closed {positions_closed} positions based on strong exit signals")
+
+            # STEP 4: Analyze all positions for reinforcement opportunities (now in correct order)
+            self.analyze_positions_for_reinforcement()
+
+        # Agentic Workflow
+        logging.info("📅 PHASE 3: Economic Calendar")
         economic_events = self.agents['data_analyst'].execute({'source': 'economic_calendar'})
+
+        logging.info("🔍 PHASE 4: Market Research")
         open_positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
         research_result = self.agents['researcher'].execute(enhanced_ufo_data, economic_events)
 
+        logging.info("🎯 PHASE 6: Trading Decisions")
         diversification_config = {
             'min_positions_for_session': self.ufo_engine.min_positions_for_session,
             'target_positions_when_available': self.ufo_engine.target_positions_when_available,
             'max_concurrent_positions': self.ufo_engine.max_concurrent_positions
         }
-
         trade_decision_str = self.agents['trader'].execute(
             research_result['consensus'],
             open_positions_df,
             diversification_config=diversification_config
         )
 
+        logging.info("⚖️ PHASE 7: Risk Assessment")
         risk_assessment = self.agents['risk_manager'].execute(trade_decision_str)
-
         if risk_assessment['portfolio_risk_status'] == "STOP_LOSS_BREACHED":
             logging.critical("!!! EQUITY STOP LOSS BREACHED. CEASING ALL TRADING. !!!")
-            # This should be handled more gracefully, maybe break the loop
             return
 
+        logging.info("💰 PHASE 8: Fund Manager Authorization")
         authorization = self.agents['fund_manager'].execute(trade_decision_str, risk_assessment)
 
-        # 6. Output with Diversification Status
-        position_count = len(open_positions_df) if open_positions_df is not None else 0
-        diversification_status = f"📊 Portfolio Diversification: {position_count}/{self.ufo_engine.max_concurrent_positions} positions"
+        # This section will be replaced by generate_cycle_summary
+        # logging.info("\n--- Live Trading Cycle Summary ---")
+        # ...
 
-        if position_count < self.ufo_engine.min_positions_for_session:
-            diversification_status += " ⚠️ Below minimum"
-        elif position_count >= self.ufo_engine.target_positions_when_available:
-            diversification_status += " ✅ Well diversified"
-        else:
-            diversification_status += " 📈 Building diversification"
-
-        logging.info("\n--- Live Trading Cycle Summary ---")
-        logging.info(f"Timestamp: {pd.Timestamp.now()}")
-        logging.info(diversification_status)
-        logging.info(f"Research Consensus: {research_result['consensus']}")
-        logging.info(f"Trade Decision: {trade_decision_str}")
-        logging.info(f"Risk Assessment: {risk_assessment}")
-        logging.info(f"Final Authorization: {authorization}")
-
-        # 7. UFO-based Trade Execution
+        # PHASE 9: Trade Execution
+        logging.info("⚡ PHASE 9: Trade Execution")
+        executed_trades_count = 0
         should_execute = "APPROVE" in authorization.upper()
 
         if not should_execute and "REJECT" in authorization.upper():
@@ -445,7 +462,6 @@ class LiveTrader:
 
         if should_execute:
             account_info = self.mt5_collector.connect() and mt5.account_info()
-            # Get economic events for UFO engine decision (matching simulation)
             economic_events_for_trade = self.agents['data_analyst'].execute({'source': 'economic_calendar'})
             should_trade, trade_reason = self.ufo_engine.should_open_new_trades(
                 current_positions=open_positions_df,
@@ -455,9 +471,9 @@ class LiveTrader:
             )
 
             if not should_trade:
-                logging.warning(f"UFO Engine: {trade_reason}")
+                logging.warning(f"UFO Engine blocked trades: {trade_reason}")
             else:
-                logging.info(f"🎯 UFO Engine: {trade_reason}")
+                logging.info(f"🎯 UFO Engine approved trades: {trade_reason}")
                 try:
                     json_match = re.search(r'{.*}', trade_decision_str, re.DOTALL)
                     if json_match:
@@ -466,86 +482,66 @@ class LiveTrader:
                         json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
                         parsed_data = json.loads(json_str)
 
-                        actions_list = []
-                        if 'actions' in parsed_data:
-                            actions_list = parsed_data['actions']
-                        elif 'trade_plan' in parsed_data:
-                            actions_list = parsed_data['trade_plan']
-                        elif 'trades' in parsed_data:
-                            for trade in parsed_data['trades']:
-                                actions_list.append({
-                                    'action': 'new_trade',
-                                    'currency_pair': trade['currency_pair'],
-                                    'direction': trade['direction'].upper(),
-                                    'volume': 0.1,
-                                    'symbol': trade['currency_pair']
-                                })
-
-                        # Execute the parsed trades
-                        logging.info(f"📋 Executing {len(actions_list)} trades from approved plan...")
+                        actions_list = parsed_data.get('actions', parsed_data.get('trade_plan', parsed_data.get('trades', [])))
                         
-                        successful_trades = 0
-                        failed_trades = 0
-                        
+                        logging.info(f"📋 Executing {len(actions_list)} actions from approved plan...")
                         for trade_action in actions_list:
-                            try:
-                                symbol = trade_action.get('currency_pair', trade_action.get('symbol', ''))
-                                direction = trade_action.get('direction', '').upper()
-                                volume = float(trade_action.get('volume', trade_action.get('lot_size', 0.1)))
-                                
-                                # Ensure symbol has correct suffix from config
-                                if not symbol.endswith('-ECN') and '-ECN' not in symbol:
-                                    symbol = symbol + '-ECN'
-                                
-                                # Convert direction to MT5 order type
-                                if direction == 'BUY':
-                                    trade_type = mt5.ORDER_TYPE_BUY
-                                elif direction == 'SELL':
-                                    trade_type = mt5.ORDER_TYPE_SELL
-                                else:
-                                    logging.error(f"Invalid direction '{direction}' for {symbol}")
-                                    failed_trades += 1
-                                    continue
-                                
-                                logging.info(f"🎯 Executing: {direction} {volume} lots of {symbol}")
-                                
-                                # Execute trade using UFO methodology (no fixed SL/TP)
-                                result = self.trade_executor.execute_ufo_trade(
-                                    symbol=symbol,
-                                    trade_type=trade_type,
-                                    volume=volume,
-                                    comment="UFO AI Trade"
-                                )
-                                
-                                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                                    logging.info(f"✅ Trade executed successfully: {symbol} {direction} {volume} lots, Ticket: {result.order}")
-                                    successful_trades += 1
-                                else:
-                                    error_msg = f"Trade failed: {symbol} {direction} {volume} lots"
-                                    if result:
-                                        error_msg += f" - RetCode: {result.retcode}"
-                                    logging.error(f"❌ {error_msg}")
-                                    failed_trades += 1
-                                    
-                            except Exception as trade_error:
-                                logging.error(f"❌ Error executing individual trade: {trade_error}")
-                                failed_trades += 1
-                        
-                        # Summary of execution results
-                        total_trades = successful_trades + failed_trades
-                        logging.info(f"\n📊 Trade Execution Summary:")
-                        logging.info(f"✅ Successful: {successful_trades}/{total_trades}")
-                        logging.info(f"❌ Failed: {failed_trades}/{total_trades}")
-                        
-                        if successful_trades > 0:
-                            logging.info(f"🎉 {successful_trades} new positions opened successfully!")
-                        else:
-                            logging.warning("⚠️ No trades were executed successfully")
+                            symbol = trade_action.get('currency_pair', trade_action.get('symbol', ''))
+                            direction = trade_action.get('direction', '').upper()
+                            volume = float(trade_action.get('volume', trade_action.get('lot_size', 0.1)))
+                            trade_type = mt5.ORDER_TYPE_BUY if direction == 'BUY' else mt5.ORDER_TYPE_SELL
 
+                            result = self.trade_executor.execute_ufo_trade(symbol=symbol, trade_type=trade_type, volume=volume, comment="UFO AI Trade")
+                            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                                logging.info(f"✅ Trade executed: {direction} {volume} {symbol}")
+                                executed_trades_count += 1
+                            else:
+                                logging.error(f"❌ Trade failed: {direction} {volume} {symbol}")
                 except Exception as e:
-                    logging.error(f"Error during UFO trade execution: {e}")
-                    import traceback
-                    logging.error(traceback.format_exc())
+                    logging.error(f"Error parsing or executing trades: {e}")
+
+        # Store UFO data for next cycle comparison
+        self.previous_ufo_data = enhanced_ufo_data
+
+        # Generate and log the cycle summary
+        self.generate_cycle_summary(executed_trades_count, research_result, trade_decision_str, risk_assessment, authorization)
+
+    def generate_cycle_summary(self, executed_trades_count, research_result, trade_decision_str, risk_assessment, authorization):
+        """Generates and logs a summary for the current trading cycle."""
+        logging.info("📋 PHASE 10: Cycle Summary")
+
+        # Update positions and P&L for the summary
+        self.update_open_positions_pnl()
+
+        open_positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
+        position_count = len(open_positions_df) if open_positions_df is not None else 0
+        unrealized_pnl = open_positions_df['profit'].sum() if open_positions_df is not None and not open_positions_df.empty else 0.0
+
+        # Get latest account info for summary
+        account_info = self.mt5_collector.connect() and mt5.account_info()
+        if account_info:
+            self.portfolio_value = account_info.equity
+            self.initial_balance = account_info.balance
+            self.mt5_collector.disconnect()
+
+        total_pnl = self.portfolio_value - self.initial_balance
+
+        diversification_status = f"📊 Portfolio Diversification: {position_count}/{self.ufo_engine.max_concurrent_positions} positions"
+        if position_count < self.ufo_engine.min_positions_for_session:
+            diversification_status += " ⚠️ Below minimum"
+        elif position_count >= self.ufo_engine.target_positions_when_available:
+            diversification_status += " ✅ Well diversified"
+
+        logging.info(f"   {diversification_status}")
+        logging.info(f"   Trades Executed in Cycle: {executed_trades_count}")
+        logging.info(f"   Open Positions: {position_count}")
+        logging.info(f"   Realized P&L: ${self.realized_pnl:+,.2f}")
+        logging.info(f"   Unrealized P&L: ${unrealized_pnl:+,.2f}")
+        logging.info(f"   Portfolio Value: ${self.portfolio_value:,.2f} (Total P&L: ${total_pnl:+,.2f})")
+        logging.info(f"   Research Consensus: {research_result['consensus']}")
+        logging.info(f"   Trade Decision: {trade_decision_str}")
+        logging.info(f"   Risk Assessment: {risk_assessment.get('portfolio_risk_status', 'N/A')}")
+        logging.info(f"   Final Authorization: {authorization}")
 
     def run(self):
         """

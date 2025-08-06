@@ -50,7 +50,8 @@ if init_result:
     
     if historical_rates is not None and len(historical_rates) > 0:
         rate = historical_rates[0]
-        print(f"✅ Historical rate found: {rate['close']:.5f} at {datetime.datetime.fromtimestamp(rate['time'])}")
+        time_val = pd.to_datetime(rate['time'])
+        print(f"✅ Historical rate found: {rate['close']:.5f} at {time_val}")
     else:
         print(f"❌ No historical rates for {target_time}")
         print(f"Last error: {mt5.last_error()}")

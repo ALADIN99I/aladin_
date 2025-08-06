@@ -56,3 +56,22 @@ def copy_rates_from_pos(symbol, timeframe, start_pos, count):
 
 def last_error():
     return "No error"
+
+
+def copy_rates_from(symbol, timeframe, date_from, count):
+    """Mock version of copy_rates_from."""
+    print(f"Mock MT5: copy_rates_from called for {symbol}, ignoring date_from {date_from}")
+    # For mock purposes, we can just return data from the start.
+    return copy_rates_from_pos(symbol, timeframe, 0, count)
+
+
+class MockAccountInfo:
+    def __init__(self, balance, equity):
+        self.balance = balance
+        self.equity = equity
+
+
+def account_info():
+    """Mock version of account_info."""
+    print("Mock MT5: Getting account info...")
+    return MockAccountInfo(balance=10000.0, equity=10000.0)
