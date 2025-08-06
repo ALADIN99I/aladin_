@@ -62,7 +62,7 @@ class LiveTrader:
 
         self.ufo_calculator = UfoCalculator(config['trading']['currencies'].split(','))
 
-        # Initialize Dynamic Reinforcement Engine
+        # Initialize dynamic reinforcement engine
         self.dynamic_reinforcement_engine = DynamicReinforcementEngine(config)
         if self.dynamic_reinforcement_engine.enabled:
             logging.info("✅ Dynamic Reinforcement Engine enabled")
@@ -71,8 +71,13 @@ class LiveTrader:
 
         # Portfolio tracking attributes
         self.last_portfolio_value = 0.0
+        self.initial_balance = 0.0  # Track initial balance for performance calculation
+        self.realized_pnl = 0.0  # Track cumulative realized P&L
         self.last_cycle_time = 0
         self.cycle_count = 0
+        self.closed_trades = []  # Track completed trades
+        self.trades_executed = []  # Track all executed trades
+        self.previous_ufo_data = None  # Store previous UFO data for comparison
         
         self._initialize_portfolio()
 
@@ -109,14 +114,17 @@ class LiveTrader:
             account_info = self.portfolio_manager.get_account_info()
             if account_info:
                 self.last_portfolio_value = account_info.equity
-                logging.info(f"✅ Portfolio initialized. Initial Equity: ${account_info.equity:,.2f}")
+                self.initial_balance = account_info.balance  # Store initial balance
+                logging.info(f"✅ Portfolio initialized. Initial Equity: ${account_info.equity:,.2f}, Initial Balance: ${account_info.balance:,.2f}")
             else:
                 logging.warning("⚠️ Could not retrieve account info. Using default of 0 for last portfolio value.")
                 self.last_portfolio_value = 0.0
+                self.initial_balance = 0.0
             self.mt5_collector.disconnect()
         else:
             logging.error("⚠️ MT5 connection failed during portfolio initialization.")
             self.last_portfolio_value = 0.0
+            self.initial_balance = 0.0
 
     def _detect_rapid_portfolio_change(self, current_value, previous_value, threshold=0.01):
         """Detects a rapid change in portfolio value (e.g., >1% change)."""
@@ -269,6 +277,22 @@ class LiveTrader:
 
         # Store UFO data for reinforcement analysis
         self.last_ufo_data = enhanced_ufo_data
+        
+        # Check for UFO exit signals if we have previous data
+        if self.previous_ufo_data and enhanced_ufo_data:
+            exit_signals = self.analyze_ufo_exit_signals(enhanced_ufo_data, self.previous_ufo_data)
+            if exit_signals:
+                logging.info(f"📈 UFO Exit Signals detected: {len(exit_signals)} currency changes")
+                for signal in exit_signals[:5]:  # Log top 5 signals
+                    logging.info(f"  ⚠️ {signal['reason']} (change: {signal['change']:.2f})")
+                
+                # Auto-close positions on strong exit signals
+                if len(exit_signals) >= 3:
+                    logging.warning("🚨 STRONG EXIT SIGNALS detected - reviewing positions")
+                    self.close_affected_positions(exit_signals)
+        
+        # Store current UFO data for next cycle comparison
+        self.previous_ufo_data = enhanced_ufo_data
         
         # 4. First Priority: UFO Portfolio Management
         open_positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
@@ -1155,3 +1179,312 @@ class LiveTrader:
                     
         except Exception as e:
             logging.error(f"Error checking portfolio status: {e}")
+    
+    # CRITICAL COMPONENT 1: Historical Price Fetching
+    def get_historical_price_for_time(self, symbol, target_time):
+        """
+        Get real historical price for a specific symbol at a specific time.
+        This enables backtesting and historical validation.
+        """
+        try:
+            if not self.mt5_collector.connect():
+                logging.warning(f"⚠️ MT5 connection failed for historical price fetch")
+                return None
+            
+            # Use data collector's method if it exists, otherwise implement here
+            if hasattr(self.mt5_collector, 'get_historical_price_for_time'):
+                result = self.mt5_collector.get_historical_price_for_time(symbol, target_time)
+                if result is not None and not result.empty:
+                    return float(result['close'].iloc[0])
+            else:
+                # Direct implementation
+                target_timestamp = int(target_time.timestamp())
+                rates = mt5.copy_rates_from(symbol, mt5.TIMEFRAME_M1, target_timestamp, 1)
+                
+                if rates is not None and len(rates) > 0:
+                    logging.info(f"✅ Using REAL data from MT5 for {symbol}")
+                    return float(rates[0]['close'])
+                else:
+                    # Fallback: get the most recent data if exact time not available
+                    rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M1, 0, 1)
+                    if rates is not None and len(rates) > 0:
+                        logging.info(f"✅ Using REAL data from MT5 for {symbol} (fallback)")
+                        return float(rates[0]['close'])
+            
+            logging.warning(f"⚠️ No historical data available for {symbol} at {target_time}")
+            return None
+            
+        except Exception as e:
+            logging.error(f"⚠️ Error getting historical price for {symbol}: {e}")
+            return None
+        finally:
+            self.mt5_collector.disconnect()
+    
+    # CRITICAL COMPONENT 2: Pip Value Multiplier
+    def get_pip_value_multiplier(self, symbol):
+        """
+        Get correct pip value multiplier for different currency pairs.
+        Critical for accurate P&L calculations.
+        """
+        symbol_clean = symbol.replace('-ECN', '').replace('/', '').upper()
+        
+        # JPY pairs use 1000 multiplier (pip = 0.01)
+        jpy_pairs = ['USDJPY', 'EURJPY', 'GBPJPY', 'AUDJPY', 'NZDJPY', 'CHFJPY', 'CADJPY']
+        if any(jpy_pair in symbol_clean for jpy_pair in jpy_pairs):
+            return 1000
+        
+        # Most other forex pairs use 10000 multiplier (pip = 0.0001)
+        return 10000
+    
+    # CRITICAL COMPONENT 3: Enhanced Portfolio Value Update
+    def update_portfolio_value(self, force_update=False):
+        """
+        Enhanced portfolio value update with automatic position management.
+        Includes P&L tracking, automatic closure on thresholds, and trailing stops.
+        """
+        try:
+            positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
+            if positions_df is None or positions_df.empty:
+                return
+            
+            account_info = self.portfolio_manager.get_account_info()
+            if not account_info:
+                return
+            
+            total_unrealized_pnl = 0.0
+            positions_to_close = []
+            
+            # Process each position
+            for _, position in positions_df.iterrows():
+                symbol = position['symbol']
+                current_pnl = position['profit']
+                total_unrealized_pnl += current_pnl
+                
+                # Get pip multiplier for accurate calculations
+                pip_multiplier = self.get_pip_value_multiplier(symbol)
+                
+                # Track peak P&L for trailing stop
+                ticket = position['ticket']
+                if not hasattr(self, '_position_peaks'):
+                    self._position_peaks = {}
+                
+                if ticket not in self._position_peaks:
+                    self._position_peaks[ticket] = current_pnl
+                else:
+                    self._position_peaks[ticket] = max(self._position_peaks[ticket], current_pnl)
+                
+                # Check automatic closure conditions
+                close_reason = None
+                
+                # 1. Profit target (default: $75)
+                profit_target = float(self.config['trading'].get('profit_target', '75.0'))
+                if current_pnl >= profit_target:
+                    close_reason = "profit_target"
+                
+                # 2. Stop loss (default: -$50)
+                stop_loss = float(self.config['trading'].get('stop_loss', '-50.0'))
+                if current_pnl <= stop_loss:
+                    close_reason = "stop_loss"
+                
+                # 3. Time-based exit (positions older than 4 hours)
+                if 'time' in position:
+                    position_age_seconds = pd.Timestamp.now().timestamp() - position['time']
+                    max_duration_hours = float(self.config['trading'].get('max_position_duration_hours', '4'))
+                    if position_age_seconds > (max_duration_hours * 3600):
+                        close_reason = "time_based_exit"
+                
+                # 4. Trailing stop
+                if self._position_peaks[ticket] > 30:  # Trailing stop activates after $30 profit
+                    trailing_stop_distance = 15  # $15 trailing distance
+                    if current_pnl < (self._position_peaks[ticket] - trailing_stop_distance):
+                        close_reason = "trailing_stop"
+                
+                if close_reason:
+                    positions_to_close.append((ticket, symbol, current_pnl, close_reason))
+            
+            # Close positions that meet criteria
+            for ticket, symbol, pnl, reason in positions_to_close:
+                logging.info(f"🎯 Auto-closing position {ticket} ({symbol}): {reason} (P&L: ${pnl:.2f})")
+                if self.trade_executor.close_trade(ticket):
+                    self.realized_pnl += pnl
+                    self.closed_trades.append({
+                        'ticket': ticket,
+                        'symbol': symbol,
+                        'pnl': pnl,
+                        'close_reason': reason,
+                        'close_time': pd.Timestamp.now()
+                    })
+            
+            # Update portfolio tracking
+            self.portfolio_manager.unrealized_pnl = total_unrealized_pnl
+            current_portfolio_value = account_info.equity
+            
+            # Log significant changes
+            portfolio_change = current_portfolio_value - self.last_portfolio_value
+            if abs(portfolio_change) > 10:
+                logging.info(f"💰 Portfolio update: ${current_portfolio_value:,.2f} (${portfolio_change:+.2f})")
+            
+            self.last_portfolio_value = current_portfolio_value
+            
+        except Exception as e:
+            logging.error(f"❌ Error in enhanced portfolio update: {e}")
+    
+    # CRITICAL COMPONENT 4: UFO Exit Signal Analysis
+    def analyze_ufo_exit_signals(self, current_ufo_data, previous_ufo_data):
+        """
+        Analyze UFO data for exit signals based on currency strength changes.
+        Critical for detecting market reversals.
+        """
+        exit_signals = []
+        
+        if previous_ufo_data is None:
+            return exit_signals
+        
+        # Extract raw UFO data from enhanced structure
+        current_raw = current_ufo_data.get('raw_data', current_ufo_data)
+        previous_raw = previous_ufo_data.get('raw_data', previous_ufo_data)
+        
+        # Check for currency strength reversals across timeframes
+        for timeframe in current_raw.keys():
+            if timeframe not in previous_raw:
+                continue
+            
+            current_strengths = current_raw[timeframe]
+            previous_strengths = previous_raw[timeframe]
+            
+            # Handle both DataFrame and dict formats
+            if hasattr(current_strengths, 'columns'):
+                currency_list = current_strengths.columns
+            else:
+                currency_list = current_strengths.keys()
+            
+            # Detect significant strength changes
+            for currency in currency_list:
+                try:
+                    if hasattr(previous_strengths, 'columns'):
+                        # DataFrame format
+                        if currency not in previous_strengths.columns:
+                            continue
+                        current_strength = current_strengths[currency].iloc[-1]
+                        previous_strength = previous_strengths[currency].iloc[-5:].mean()
+                    else:
+                        # Dict format
+                        if currency not in previous_strengths:
+                            continue
+                        current_strength = current_strengths[currency][-1] if isinstance(current_strengths[currency], list) else current_strengths[currency]
+                        prev_values = previous_strengths[currency][-5:] if isinstance(previous_strengths[currency], list) else [previous_strengths[currency]]
+                        previous_strength = sum(prev_values) / len(prev_values) if prev_values else 0
+                    
+                    # Signal strength reversal (threshold: 2.0)
+                    strength_change = current_strength - previous_strength
+                    if abs(strength_change) > 2.0:
+                        direction_change = "strengthening" if strength_change > 0 else "weakening"
+                        exit_signals.append({
+                            'currency': currency,
+                            'timeframe': timeframe,
+                            'change': strength_change,
+                            'direction': direction_change,
+                            'reason': f"{currency} {direction_change} on {timeframe}"
+                        })
+                except Exception as e:
+                    logging.warning(f"Error analyzing {currency} on {timeframe}: {e}")
+                    continue
+        
+        return exit_signals
+    
+    # CRITICAL COMPONENT 5: Currency Pair Validation and Correction
+    def validate_and_correct_currency_pair(self, pair, direction=None):
+        """
+        Validate and correct currency pair format.
+        Handles inverted pairs and returns corrected pair with adjusted direction.
+        """
+        # Use UFO engine's validation if available
+        if hasattr(self.ufo_engine, 'validate_and_correct_currency_pair'):
+            return self.ufo_engine.validate_and_correct_currency_pair(pair, direction if direction else 'BUY')
+        
+        # Otherwise, implement validation logic
+        valid_pairs = [
+            'EURUSD', 'GBPUSD', 'USDJPY', 'AUDUSD', 'USDCAD', 'USDCHF',
+            'EURAUD', 'EURCAD', 'EURCHF', 'EURGBP', 'EURJPY', 'EURNZD',
+            'GBPAUD', 'GBPCAD', 'GBPCHF', 'GBPJPY', 'GBPNZD',
+            'AUDCAD', 'AUDCHF', 'AUDJPY', 'AUDNZD',
+            'CADCHF', 'CADJPY', 'CHFJPY', 'NZDCAD', 'NZDCHF', 'NZDJPY',
+            'NZDUSD'
+        ]
+        
+        # Clean the pair
+        clean_pair = pair.replace('-ECN', '').replace('/', '').upper()
+        
+        # If already valid, return it
+        if clean_pair in valid_pairs:
+            return clean_pair, direction if direction else None
+        
+        # Try to extract base and quote currencies
+        if len(clean_pair) >= 6:
+            base = clean_pair[:3]
+            quote = clean_pair[3:6]
+            
+            # Check if inverted pair exists
+            inverted = quote + base
+            if inverted in valid_pairs:
+                logging.info(f"⚠️ Correcting inverted pair: {clean_pair} -> {inverted}")
+                # Invert direction if provided
+                if direction:
+                    new_direction = 'SELL' if direction.upper() == 'BUY' else 'BUY'
+                    return inverted, new_direction
+                return inverted, None
+        
+        # Log error for invalid pair
+        logging.error(f"❌ Invalid currency pair: {pair} (cleaned: {clean_pair})")
+        return None, None
+    
+    def close_affected_positions(self, exit_signals):
+        """
+        Close positions affected by strong UFO exit signals.
+        """
+        try:
+            positions_closed = 0
+            currencies_to_close = set()
+            
+            # Extract currencies from exit signals
+            for signal in exit_signals:
+                currencies_to_close.add(signal['currency'])
+            
+            positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
+            if positions_df is None or positions_df.empty:
+                return 0
+            
+            # Find positions that involve these currencies
+            for _, position in positions_df.iterrows():
+                symbol = position['symbol'].replace('-ECN', '')
+                
+                # Extract base and quote currencies
+                if len(symbol) >= 6:
+                    base_currency = symbol[:3]
+                    quote_currency = symbol[3:6]
+                    
+                    # Check if either currency is affected by exit signals
+                    if base_currency in currencies_to_close or quote_currency in currencies_to_close:
+                        logging.info(f"🚨 Closing {symbol} due to {base_currency}/{quote_currency} exit signals")
+                        if self.trade_executor.close_trade(position['ticket']):
+                            positions_closed += 1
+                            # Track the closed trade
+                            self.closed_trades.append({
+                                'ticket': position['ticket'],
+                                'symbol': symbol,
+                                'pnl': position.get('profit', 0.0),
+                                'close_reason': 'UFO_exit_signal',
+                                'close_time': pd.Timestamp.now()
+                            })
+                            self.realized_pnl += position.get('profit', 0.0)
+            
+            if positions_closed > 0:
+                logging.info(f"📉 Closed {positions_closed} positions based on UFO exit signals")
+                # Update portfolio value after closures
+                self.update_portfolio_value(force_update=True)
+            
+            return positions_closed
+            
+        except Exception as e:
+            logging.error(f"❌ Error closing affected positions: {e}")
+            return 0
