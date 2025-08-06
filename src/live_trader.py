@@ -81,6 +81,12 @@ class LiveTrader:
         
         self._initialize_portfolio()
 
+    def check_session_status(self):
+        """Check if the current time is within active trading hours (8:00-20:00 GMT)."""
+        gmt = pytz.timezone('GMT')
+        now_gmt = datetime.now(gmt)
+        return 8 <= now_gmt.hour < 20
+
     def _setup_logging(self):
         """Configures structured logging for the application."""
         # Create file handler with UTF-8 encoding
@@ -518,7 +524,7 @@ class LiveTrader:
                     if now - self.last_cycle_time >= self.cycle_period_seconds:
                         self.cycle_count += 1  # Increment cycle counter
                         
-                        if self.ufo_engine.is_active_session():
+                        if self.check_session_status():
                             self.run_main_trading_cycle()
                         else:
                             logging.info(f"({datetime.now().strftime('%H:%M:%S')}) Outside active trading session. Skipping main cycle.")
