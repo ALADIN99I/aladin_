@@ -2,6 +2,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime, time
 import pytz
+from . import utils
 try:
     import MetaTrader5 as mt5
 except ImportError:
@@ -16,40 +17,20 @@ class UFOTradingEngine:
     - Portfolio-level risk management
     """
     
-    def __init__(self, config):
+    def __init__(self, config, ufo_calculator):
         self.config = config
-        # Read from trading section, default to -5.0 if not found
-        portfolio_stop_raw = config['trading'].get('portfolio_equity_stop', '-5.0')
-        # Handle config values with inline comments like '-5.0 (-3.0)'
-        portfolio_stop_clean = portfolio_stop_raw.split(' ')[0].split('(')[0].strip()
-        self.portfolio_equity_stop = float(portfolio_stop_clean)  # -5% portfolio stop
-        self.session_timezone = pytz.timezone('Europe/London')  # Trading sessions reference
+        self.ufo_calculator = ufo_calculator
         
-        # Intelligent Diversification Parameters (maintains quality-based decisions)
-        # Parse config values properly (strip comments and whitespace)
-        def parse_config_int(key, default):
-            value = config['trading'].get(key, str(default))
-            # Remove inline comments and whitespace
-            clean_value = value.split('#')[0].strip()
-            return int(clean_value)
+        # Centralized config parsing using the new utility
+        self.portfolio_equity_stop = utils.get_config_value(config, 'trading', 'portfolio_equity_stop', -5.0)
+        self.session_timezone = pytz.timezone(utils.get_config_value(config, 'trading', 'session_timezone', 'Europe/London'))
         
-        def parse_config_float(key, default):
-            value = config['trading'].get(key, str(default))
-            # Remove inline comments and whitespace
-            clean_value = value.split('#')[0].strip()
-            return float(clean_value)
-        
-        def parse_config_str(key, default):
-            value = config['trading'].get(key, default)
-            # Remove inline comments and whitespace
-            clean_value = value.split('#')[0].strip()
-            return clean_value
-        
-        self.max_concurrent_positions = parse_config_int('max_concurrent_positions', 9)
-        self.target_positions_when_available = parse_config_int('target_positions_when_available', 4)
-        self.min_positions_for_session = parse_config_int('min_positions_for_session', 2)
-        self.max_correlation_threshold = parse_config_float('max_correlation_threshold', 0.75)
-        self.diversification_preference = parse_config_str('diversification_preference', 'balanced')
+        # Intelligent Diversification Parameters
+        self.max_concurrent_positions = utils.get_config_value(config, 'trading', 'max_concurrent_positions', 9)
+        self.target_positions_when_available = utils.get_config_value(config, 'trading', 'target_positions_when_available', 4)
+        self.min_positions_for_session = utils.get_config_value(config, 'trading', 'min_positions_for_session', 2)
+        self.max_correlation_threshold = utils.get_config_value(config, 'trading', 'max_correlation_threshold', 0.75)
+        self.diversification_preference = utils.get_config_value(config, 'trading', 'diversification_preference', 'balanced')
         
         # Configuration loaded successfully - diversification parameters active
         
@@ -63,6 +44,64 @@ class UFOTradingEngine:
         self.coherence_requirement = 0.6  # Minimum coherence for high-confidence trades
         self.volatility_adjustment_factor = 0.5  # Position scaling in volatile conditions
         
+    def validate_and_correct_currency_pair(self, currency_pair, direction):
+        """
+        Validates a currency pair and corrects for inverted versions (e.g., CADUSD -> USDCAD).
+        Returns the corrected pair and an adjusted direction if a swap occurred.
+        """
+        # Standard pairs that are commonly traded
+        standard_pairs = {
+            "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
+            "EURGBP", "EURJPY", "EURAUD", "EURCAD", "EURCHF", "EURNZD",
+            "GBPJPY", "GBPAUD", "GBPCAD", "GBPCHF", "GBPNZD",
+            "AUDJPY", "AUDCAD", "AUDCHF", "AUDNZD",
+            "CADJPY", "CADCHF",
+            "CHFJPY",
+            "NZDJPY", "NZDCAD", "NZDCHF"
+        }
+
+        # Mapping for inverted pairs to their standard counterparts
+        inversion_map = {
+            "USDEUR": "EURUSD", "USDGBP": "GBPUSD", "JPYUSD": "USDJPY", "CHFUSD": "USDCHF",
+            "CADUSD": "USDCAD", "USDAUD": "AUDUSD", "USDNZD": "NZDUSD",
+            "GBPEUR": "EURGBP", "JPYEUR": "EURJPY", "AUDEUR": "EURAUD", "CADEUR": "EURCAD",
+            "CHFEUR": "EURCHF", "NZDEUR": "EURNZD",
+            "JPYGBP": "GBPJPY", "AUDGBP": "GBPAUD", "CADGBP": "GBPCAD", "CHFGBP": "GBPCHF",
+            "NZDGBP": "GBPNZD",
+            "JPYAUD": "AUDJPY", "CADAUD": "AUDCAD", "CHFAUD": "AUDCHF", "NZDAUD": "AUDNZD",
+            "JPYCAD": "CADJPY", "CHFCAD": "CADCHF",
+            "JPYCHF": "CHFJPY",
+            "JPYNZD": "NZDJPY", "CADNZD": "NZDCAD", "CHFNZD": "NZDCHF"
+        }
+
+        original_pair = currency_pair.upper()
+        corrected_pair = original_pair
+        adjusted_direction = direction
+
+        if original_pair in standard_pairs:
+            # It's a standard pair, no changes needed
+            return original_pair, direction
+
+        if original_pair in inversion_map:
+            # It's an inverted pair that needs to be corrected
+            corrected_pair = inversion_map[original_pair]
+
+            # Invert the trade direction
+            if direction.upper() == 'BUY':
+                adjusted_direction = 'SELL'
+            elif direction.upper() == 'SELL':
+                adjusted_direction = 'BUY'
+
+            print(f"Currency pair inverted: {original_pair} -> {corrected_pair}. Direction changed: {direction} -> {adjusted_direction}")
+
+        else:
+            # The pair is not in our standard or inverted list.
+            # This could be an exotic pair or an error.
+            # For now, we'll assume it might be valid but log a warning.
+            print(f"Warning: Currency pair '{original_pair}' not found in standard or inversion maps. Proceeding without changes.")
+
+        return corrected_pair, adjusted_direction
+
     def should_trade_now(self):
         """
         Determines if trading should occur based on session timing
@@ -189,40 +228,32 @@ class UFOTradingEngine:
     
     def check_multi_timeframe_coherence(self, ufo_data):
         """
-        Checks if currency strength is consistent across timeframes
-        Flags positions where coherence is lost
+        Checks currency strength coherence across timeframes using the UfoCalculator.
+        Returns a list of currencies with coherence issues.
         """
+        if not hasattr(self, 'ufo_calculator'):
+            print("Warning: UfoCalculator not available to UFOTradingEngine.")
+            return [] # Cannot perform advanced coherence check
+
+        # The ufo_data structure might be nested, ensure we pass the raw data
+        raw_ufo_data = ufo_data.get('raw_data', ufo_data)
+        
+        coherence_analysis = self.ufo_calculator.detect_timeframe_coherence(raw_ufo_data)
+        
         coherence_issues = []
-        
-        if len(ufo_data) < 2:
+        if not coherence_analysis:
             return coherence_issues
+
+        for currency, analysis in coherence_analysis.items():
+            # Use a threshold from config or a default value
+            weak_coherence_threshold = self.config['trading'].getfloat('weak_coherence_threshold', 0.6)
             
-        timeframes = list(ufo_data.keys())
-        currencies = list(ufo_data[timeframes[0]].columns)
-        
-        for currency in currencies:
-            strengths_by_tf = {}
-            
-            # Get latest strength for each timeframe
-            for tf in timeframes:
-                if currency in ufo_data[tf].columns:
-                    strengths_by_tf[tf] = ufo_data[tf][currency].iloc[-1]
-            
-            if len(strengths_by_tf) < 2:
-                continue
-                
-            # Check if all timeframes agree on direction (all positive or all negative)
-            values = list(strengths_by_tf.values())
-            all_positive = all(v > 0 for v in values)
-            all_negative = all(v < 0 for v in values)
-            
-            if not (all_positive or all_negative):
-                # Timeframes disagree - coherence issue
+            if analysis.get('overall_coherence', 1.0) < weak_coherence_threshold:
                 coherence_issues.append({
                     'currency': currency,
-                    'strengths': strengths_by_tf,
-                    'issue': 'Timeframe divergence',
-                    'recommendation': 'Consider closing positions'
+                    'strengths': analysis.get('timeframe_strengths', {}),
+                    'issue': f"Weak coherence ({analysis.get('overall_coherence', 0.0):.2f})",
+                    'recommendation': 'Consider closing positions involving this currency.'
                 })
         
         return coherence_issues

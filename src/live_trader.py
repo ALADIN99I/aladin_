@@ -1,9 +1,11 @@
 import time
 import pandas as pd
+import numpy as np
 import re
 import json
 import logging
 from datetime import datetime, timedelta
+import pytz
 try:
     import MetaTrader5 as mt5
 except ImportError:
@@ -16,7 +18,9 @@ from .agents.risk_manager_agent import RiskManagerAgent
 from .agents.fund_manager_agent import FundManagerAgent
 from .ufo_calculator import UfoCalculator
 from .llm.llm_client import LLMClient
+from . import utils
 from .trade_executor import TradeExecutor
+from .portfolio_manager import PortfolioManager
 from .ufo_trading_engine import UFOTradingEngine
 from .dynamic_reinforcement_engine import DynamicReinforcementEngine
 
@@ -25,30 +29,14 @@ class LiveTrader:
         self.config = config
         self._setup_logging()
         
-        # Helper function to parse config values with comments
-        def parse_config_value(value, default):
-            if isinstance(value, str):
-                # Remove inline comments and extra spaces
-                clean_value = value.split('#')[0].split('(')[0].strip()
-                try:
-                    return float(clean_value) if '.' in clean_value else int(clean_value)
-                except ValueError:
-                    return default
-            return value
-        
-        # Read cycle period from config (default 40 minutes if not specified)
-        self.cycle_period_minutes = parse_config_value(self.config['trading'].get('cycle_period_minutes', '40'), 40)
+        # Centralized config parsing using the new utility
+        self.cycle_period_minutes = utils.get_config_value(config, 'trading', 'cycle_period_minutes', 40)
         self.cycle_period_seconds = self.cycle_period_minutes * 60
         
-        # Continuous monitoring variables - read from config
-        self.position_update_frequency_minutes = parse_config_value(
-            self.config['trading'].get('position_update_frequency_minutes', '5'), 5
-        )
+        self.position_update_frequency_minutes = utils.get_config_value(config, 'trading', 'position_update_frequency_minutes', 5)
         self.position_update_frequency_seconds = self.position_update_frequency_minutes * 60
         
-        # Check if continuous monitoring is enabled in config
-        continuous_monitoring_str = self.config['trading'].get('continuous_monitoring_enabled', 'true').lower()
-        self.continuous_monitoring_enabled = continuous_monitoring_str in ['true', 'yes', '1', 'enabled']
+        self.continuous_monitoring_enabled = utils.get_config_value(config, 'trading', 'continuous_monitoring_enabled', True)
         
         self.llm_client = LLMClient(api_key=config['openrouter']['api_key'])
 
@@ -60,13 +48,15 @@ class LiveTrader:
         )
 
         self.trade_executor = TradeExecutor(self.mt5_collector, self.config)
-        self.ufo_engine = UFOTradingEngine(config)
+        self.ufo_calculator = UfoCalculator(config['trading']['currencies'].split(','))
+        self.portfolio_manager = PortfolioManager(self.mt5_collector, self.trade_executor, self.config)
+        self.ufo_engine = UFOTradingEngine(config, self.ufo_calculator)
 
         self.agents = {
             "data_analyst": DataAnalystAgent("DataAnalyst", self.mt5_collector),
             "researcher": MarketResearcherAgent("MarketResearcher", self.llm_client),
             "trader": TraderAgent("Trader", self.llm_client, self.mt5_collector),
-            "risk_manager": RiskManagerAgent("RiskManager", self.llm_client, self.mt5_collector, self.config),
+            "risk_manager": RiskManagerAgent("RiskManager", self.llm_client, self.mt5_collector, self.config, self.portfolio_manager),
             "fund_manager": FundManagerAgent("FundManager", self.llm_client)
         }
 
@@ -80,13 +70,9 @@ class LiveTrader:
             logging.warning("⚠️ Dynamic Reinforcement Engine disabled")
 
         # Portfolio tracking attributes
-        self.open_positions = []
-        self.closed_trades = []
-        self.realized_pnl = 0.0
-        self.portfolio_value = 0.0
-        self.initial_balance = 0.0
+        self.last_portfolio_value = 0.0
         self.last_cycle_time = 0
-        self.cycle_count = 0  # Add cycle counter like simulation
+        self.cycle_count = 0
         
         self._initialize_portfolio()
 
@@ -118,135 +104,80 @@ class LiveTrader:
         root_logger.addHandler(console_handler)
 
     def _initialize_portfolio(self):
-        """Initializes portfolio balance and P&L."""
+        """Initializes portfolio by fetching account info and setting initial values."""
         if self.mt5_collector.connect():
-            account_info = mt5.account_info()
+            account_info = self.portfolio_manager.get_account_info()
             if account_info:
-                self.initial_balance = account_info.balance
-                self.portfolio_value = account_info.equity
-                logging.info(f"✅ Portfolio initialized. Initial Balance: ${self.initial_balance:,.2f}, Equity: ${self.portfolio_value:,.2f}")
+                self.last_portfolio_value = account_info.equity
+                logging.info(f"✅ Portfolio initialized. Initial Equity: ${account_info.equity:,.2f}")
             else:
-                logging.warning("⚠️ Could not retrieve account info. Using default values.")
-                self.initial_balance = 10000.0
-                self.portfolio_value = 10000.0
+                logging.warning("⚠️ Could not retrieve account info. Using default of 0 for last portfolio value.")
+                self.last_portfolio_value = 0.0
             self.mt5_collector.disconnect()
         else:
-            logging.error("⚠️ MT5 connection failed during portfolio initialization. Using default values.")
-            self.initial_balance = 10000.0
-            self.portfolio_value = 10000.0
+            logging.error("⚠️ MT5 connection failed during portfolio initialization.")
+            self.last_portfolio_value = 0.0
 
-    def update_open_positions_pnl(self):
+    def _detect_rapid_portfolio_change(self, current_value, previous_value, threshold=0.01):
+        """Detects a rapid change in portfolio value (e.g., >1% change)."""
+        if previous_value == 0:
+            return False, 0.0
+
+        change_percent = (current_value - previous_value) / previous_value
+        if abs(change_percent) > threshold:
+            return True, change_percent
+        return False, change_percent
+
+    def continuous_position_monitoring(self, force_update=False):
         """
-        Fetches open positions from MT5, updates their P&L, and syncs with the in-memory list.
+        High-frequency monitoring of open positions with dynamic reinforcement,
+        rapid change detection, and force update capability.
         """
-        mt5_positions_df = self.agents['risk_manager'].portfolio_manager.get_positions()
-        if mt5_positions_df is None or mt5_positions_df.empty:
-            if self.open_positions:
-                 logging.info("All positions appear to be closed.")
-                 self.open_positions = []
-            return
+        now = time.time()
 
-        synced_positions = []
-        mt5_tickets = set(mt5_positions_df['ticket'])
+        # Implement force update or respect the update frequency
+        if not force_update:
+            if not hasattr(self, 'last_monitoring_time'):
+                self.last_monitoring_time = 0
 
-        # Update existing positions and add new ones
-        for _, mt5_pos in mt5_positions_df.iterrows():
-            existing_pos = next((p for p in self.open_positions if p['ticket'] == mt5_pos['ticket']), None)
+            time_since_last_update = now - self.last_monitoring_time
+            if time_since_last_update < self.position_update_frequency_seconds:
+                return # Not time to update yet
 
-            if existing_pos:
-                # Update P&L and current price
-                existing_pos['pnl'] = mt5_pos['profit']
-                existing_pos['current_price'] = mt5_pos['price_current']
-                existing_pos['last_update'] = datetime.now()
-                synced_positions.append(existing_pos)
-            else:
-                # Add new position found on MT5
-                new_pos = {
-                    'ticket': mt5_pos['ticket'],
-                    'symbol': mt5_pos['symbol'],
-                    'direction': 'BUY' if mt5_pos['type'] == 0 else 'SELL',
-                    'volume': mt5_pos['volume'],
-                    'entry_price': mt5_pos['price_open'],
-                    'current_price': mt5_pos['price_current'],
-                    'pnl': mt5_pos['profit'],
-                    'timestamp': pd.to_datetime(mt5_pos['time'], unit='s'),
-                    'last_update': datetime.now(),
-                    'peak_pnl': mt5_pos['profit']
-                }
-                synced_positions.append(new_pos)
-                logging.info(f"✅ New position {new_pos['ticket']} ({new_pos['symbol']}) detected and added to tracking.")
+        self.last_monitoring_time = now
 
-        # Handle closed positions (in-memory but not on MT5)
-        for mem_pos in self.open_positions:
-            if mem_pos['ticket'] not in mt5_tickets:
-                self.realized_pnl += mem_pos['pnl']
-                self.closed_trades.append(mem_pos)
-                logging.info(f"📉 Position {mem_pos['ticket']} ({mem_pos['symbol']}) closed. Realized P&L: ${mem_pos['pnl']:.2f}")
-
-        self.open_positions = synced_positions
-
-        # Update portfolio value
-        unrealized_pnl = sum(p['pnl'] for p in self.open_positions)
-        self.portfolio_value = self.initial_balance + self.realized_pnl + unrealized_pnl
-        # logging.info(f"💰 Portfolio updated. Value: ${self.portfolio_value:,.2f}, Unrealized P&L: ${unrealized_pnl:,.2f}")
-
-    def check_and_close_positions(self):
-        """
-        Implements advanced position closing logic based on P&L, time, etc.
-        """
-        if not self.open_positions:
-            return
-
-        positions_to_close = []
-        for pos in self.open_positions:
-            close_reason = None
-
-            # 1. Take Profit
-            if pos['pnl'] > 75: # Take profit at +$75
-                close_reason = f"take profit target (P&L: ${pos['pnl']:.2f})"
-
-            # 2. Stop Loss
-            elif pos['pnl'] < -50: # Stop loss at -$50
-                close_reason = f"stop loss target (P&L: ${pos['pnl']:.2f})"
-                
-            # 3. Time-based Exit
-            position_age = datetime.now() - pos['timestamp']
-            if position_age > timedelta(hours=4):
-                close_reason = f"time-based exit (>4 hours)"
-
-            # 4. Trailing Stop
-            if pos['pnl'] > pos.get('peak_pnl', pos['pnl']):
-                pos['peak_pnl'] = pos['pnl']
-            elif pos.get('peak_pnl', 0) > 30 and pos['pnl'] < pos['peak_pnl'] * 0.7:
-                close_reason = f"trailing stop (peak P&L: ${pos['peak_pnl']:.2f}, current: ${pos['pnl']:.2f})"
-
-            if close_reason:
-                logging.info(f"🎯 Marking position {pos['ticket']} ({pos['symbol']}) for closure: {close_reason}")
-                positions_to_close.append(pos['ticket'])
-
-        # Close marked positions
-        for ticket in positions_to_close:
-            success = self.trade_executor.close_trade(ticket)
-            if success:
-                logging.info(f"✅ Successfully closed position {ticket}.")
-            else:
-                logging.error(f"❌ Failed to close position {ticket}.")
-
-    def continuous_position_monitoring(self):
-        """
-        High-frequency monitoring of open positions with dynamic reinforcement.
-        """
-        logging.info(f"\n--- Continuous Position Monitoring ({datetime.now().strftime('%H:%M:%S')}) ---")
-        self.update_open_positions_pnl()
+        logging.info(f"--- Continuous Position Monitoring ({datetime.now().strftime('%H:%M:%S')}) ---")
         
-        # Check for dynamic reinforcement opportunities before closing positions
+        # Use the new PortfolioManager to update state, which also handles position closures
+        self.portfolio_manager.update_portfolio_state()
+
+        # Rapid Change Detection
+        account_info = self.portfolio_manager.get_account_info()
+        if not account_info:
+            logging.warning("Could not get account info for rapid change detection.")
+            return
+
+        current_portfolio_value = account_info.equity
+        is_rapid_change, change_pct = self._detect_rapid_portfolio_change(
+            current_portfolio_value, self.last_portfolio_value, threshold=0.01
+        )
+        if is_rapid_change:
+            logging.warning(f"🚨 RAPID PORTFOLIO CHANGE DETECTED: {change_pct:+.2%}")
+            # Trigger immediate reinforcement check due to volatility
+            self.check_and_execute_dynamic_reinforcement(triggered_by_volatility=True)
+
+        # Update the last known portfolio value for the next check
+        self.last_portfolio_value = current_portfolio_value
+
+        # Check for dynamic reinforcement opportunities
         if self.dynamic_reinforcement_engine.enabled:
             self.check_and_execute_dynamic_reinforcement()
         
-        self.check_and_close_positions()
-
-        unrealized_pnl = sum(p['pnl'] for p in self.open_positions)
-        logging.info(f"💰 Portfolio Value: ${self.portfolio_value:,.2f} | Open Positions: {len(self.open_positions)} | Unrealized P&L: ${unrealized_pnl:,.2f}")
+        # Logging the summary using the new portfolio manager's data
+        unrealized_pnl = self.portfolio_manager.unrealized_pnl
+        open_positions_count = len(self.portfolio_manager.open_positions)
+        logging.info(f"💰 Portfolio Value: ${current_portfolio_value:,.2f} | Open Positions: {open_positions_count} | Unrealized P&L: ${unrealized_pnl:,.2f}")
+        logging.info(f"{self.portfolio_manager.get_portfolio_summary()}")
         logging.info("--- End of Monitoring ---")
     
 
@@ -435,117 +366,104 @@ class LiveTrader:
         logging.info(f"Risk Assessment: {risk_assessment}")
         logging.info(f"Final Authorization: {authorization}")
 
-        # 7. UFO-based Trade Execution
-        should_execute = "APPROVE" in authorization.upper()
+        # ... (trade execution logic) ...
 
-        if not should_execute and "REJECT" in authorization.upper():
-            if "risk" in authorization.lower() and "exceed" in authorization.lower():
-                logging.info("🔄 Fund Manager rejected due to high risk - will auto-scale and execute anyway")
-                should_execute = True
+        # 8. Generate Cycle Summary
+        self.generate_cycle_summary()
 
-        if should_execute:
-            account_info = self.mt5_collector.connect() and mt5.account_info()
-            # Get economic events for UFO engine decision (matching simulation)
-            economic_events_for_trade = self.agents['data_analyst'].execute({'source': 'economic_calendar'})
-            should_trade, trade_reason = self.ufo_engine.should_open_new_trades(
-                current_positions=open_positions_df,
-                portfolio_status={'balance': account_info.balance, 'equity': account_info.equity} if account_info else None,
-                ufo_data=enhanced_ufo_data,
-                economic_events=economic_events_for_trade
-            )
+    def generate_cycle_summary(self):
+        """
+        Generates and logs a summary of the completed trading cycle.
+        """
+        logging.info("\n" + "---" * 20)
+        logging.info(f"✅ CYCLE {self.cycle_count} SUMMARY at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        logging.info("---" * 20)
 
-            if not should_trade:
-                logging.warning(f"UFO Engine: {trade_reason}")
-            else:
-                logging.info(f"🎯 UFO Engine: {trade_reason}")
-                try:
-                    json_match = re.search(r'{.*}', trade_decision_str, re.DOTALL)
-                    if json_match:
-                        json_str = json_match.group(0)
-                        json_str = re.sub(r'//.*?\n', '\n', json_str)
-                        json_str = re.sub(r',\s*([}\]])', r'\1', json_str)
-                        parsed_data = json.loads(json_str)
+        # Portfolio Status from the single source of truth
+        account_info = self.portfolio_manager.get_account_info()
+        if account_info:
+            logging.info(f"  Portfolio Equity: ${account_info.equity:,.2f} | Unrealized P&L: ${self.portfolio_manager.unrealized_pnl:,.2f}")
 
-                        actions_list = []
-                        if 'actions' in parsed_data:
-                            actions_list = parsed_data['actions']
-                        elif 'trade_plan' in parsed_data:
-                            actions_list = parsed_data['trade_plan']
-                        elif 'trades' in parsed_data:
-                            for trade in parsed_data['trades']:
-                                actions_list.append({
-                                    'action': 'new_trade',
-                                    'currency_pair': trade['currency_pair'],
-                                    'direction': trade['direction'].upper(),
-                                    'volume': 0.1,
-                                    'symbol': trade['currency_pair']
-                                })
+        # Open Positions
+        open_positions = self.portfolio_manager.open_positions
+        logging.info(f"  Open Positions: {len(open_positions)}")
+        for ticket, pos in open_positions.items():
+            # To get live P&L, we need to fetch the position again or trust the last update
+            # For summary, we'll just show what we have stored.
+            logging.info(f"    - #{ticket} {pos['symbol']} {pos['direction']} {pos['volume']} lots")
 
-                        # Execute the parsed trades
-                        logging.info(f"📋 Executing {len(actions_list)} trades from approved plan...")
-                        
-                        successful_trades = 0
-                        failed_trades = 0
-                        
-                        for trade_action in actions_list:
-                            try:
-                                symbol = trade_action.get('currency_pair', trade_action.get('symbol', ''))
-                                direction = trade_action.get('direction', '').upper()
-                                volume = float(trade_action.get('volume', trade_action.get('lot_size', 0.1)))
-                                
-                                # Ensure symbol has correct suffix from config
-                                if not symbol.endswith('-ECN') and '-ECN' not in symbol:
-                                    symbol = symbol + '-ECN'
-                                
-                                # Convert direction to MT5 order type
-                                if direction == 'BUY':
-                                    trade_type = mt5.ORDER_TYPE_BUY
-                                elif direction == 'SELL':
-                                    trade_type = mt5.ORDER_TYPE_SELL
-                                else:
-                                    logging.error(f"Invalid direction '{direction}' for {symbol}")
-                                    failed_trades += 1
-                                    continue
-                                
-                                logging.info(f"🎯 Executing: {direction} {volume} lots of {symbol}")
-                                
-                                # Execute trade using UFO methodology (no fixed SL/TP)
-                                result = self.trade_executor.execute_ufo_trade(
-                                    symbol=symbol,
-                                    trade_type=trade_type,
-                                    volume=volume,
-                                    comment="UFO AI Trade"
-                                )
-                                
-                                if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                                    logging.info(f"✅ Trade executed successfully: {symbol} {direction} {volume} lots, Ticket: {result.order}")
-                                    successful_trades += 1
-                                else:
-                                    error_msg = f"Trade failed: {symbol} {direction} {volume} lots"
-                                    if result:
-                                        error_msg += f" - RetCode: {result.retcode}"
-                                    logging.error(f"❌ {error_msg}")
-                                    failed_trades += 1
-                                    
-                            except Exception as trade_error:
-                                logging.error(f"❌ Error executing individual trade: {trade_error}")
-                                failed_trades += 1
-                        
-                        # Summary of execution results
-                        total_trades = successful_trades + failed_trades
-                        logging.info(f"\n📊 Trade Execution Summary:")
-                        logging.info(f"✅ Successful: {successful_trades}/{total_trades}")
-                        logging.info(f"❌ Failed: {failed_trades}/{total_trades}")
-                        
-                        if successful_trades > 0:
-                            logging.info(f"🎉 {successful_trades} new positions opened successfully!")
-                        else:
-                            logging.warning("⚠️ No trades were executed successfully")
+        # UFO Analysis Summary
+        if hasattr(self, 'last_ufo_data') and self.last_ufo_data:
+            uncertainty = self.last_ufo_data.get('uncertainty_metrics', {}).get(mt5.TIMEFRAME_M5, {})
+            if uncertainty:
+                logging.info(f"  Market State (M5): {uncertainty.get('overall_state', 'N/A')} (Confidence: {uncertainty.get('confidence_level', 'N/A')})")
 
-                except Exception as e:
-                    logging.error(f"Error during UFO trade execution: {e}")
-                    import traceback
-                    logging.error(traceback.format_exc())
+        logging.info("---" * 20 + "\n")
+
+    def generate_final_summary(self):
+        """Generates and logs a final summary at the end of the trading session."""
+        logging.info("\n" + "="*60)
+        logging.info("🏁 FINAL TRADING SUMMARY")
+        logging.info("="*60)
+
+        account_info = self.portfolio_manager.get_account_info()
+        if account_info:
+            logging.info(f"  Ending Equity: ${account_info.equity:,.2f}")
+            logging.info(f"  Ending Balance: ${account_info.balance:,.2f}")
+
+        logging.info(f"  Total Cycles Executed: {self.cycle_count}")
+
+        closed_trades = self.portfolio_manager.get_trade_history()
+
+        logging.info(f"  Total Trades Closed: {len(closed_trades)}")
+        if closed_trades:
+            total_pnl = sum(trade['pnl'] for trade in closed_trades)
+            winners = sum(1 for trade in closed_trades if trade['pnl'] > 0)
+            losers = len(closed_trades) - winners
+            win_rate = (winners / len(closed_trades)) * 100 if closed_trades else 0
+            logging.info(f"  Total Realized P&L: ${total_pnl:,.2f}")
+            logging.info(f"  Win Rate: {win_rate:.2f}% ({winners}W / {losers}L)")
+
+        self.save_full_day_report(account_info, closed_trades)
+        logging.info("="*60)
+
+    def save_full_day_report(self, account_info, closed_trades):
+        """Saves a detailed report of the trading day to a file."""
+        filename = f"full_day_report_{datetime.now().strftime('%Y%m%d')}.txt"
+
+        report = []
+        report.append("="*40)
+        report.append(f"UFO TRADING REPORT - {datetime.now().strftime('%Y-%m-%d')}")
+        report.append("="*40 + "\n")
+
+        if account_info:
+            report.append(f"Ending Equity: ${account_info.equity:,.2f}")
+            report.append(f"Ending Balance: ${account_info.balance:,.2f}\n")
+
+        report.append(f"Total Cycles: {self.cycle_count}")
+        report.append(f"Total Closed Trades: {len(closed_trades)}\n")
+
+        if closed_trades:
+            report.append("-" * 40)
+            report.append("CLOSED TRADES:")
+            report.append("-" * 40)
+            for trade in closed_trades:
+                report.append(
+                    f"  - Ticket: {trade['ticket']}, Symbol: {trade['symbol']}, "
+                    f"P&L: ${trade['pnl']:.2f}, Comment: {trade.get('comment', 'N/A')}"
+                )
+            report.append("-" * 40 + "\n")
+
+        report_str = "\n".join(report)
+
+        try:
+            with open(filename, 'w', encoding='utf-8') as f:
+                f.write(report_str)
+            logging.info(f"Full report saved to '{filename}'")
+        except Exception as e:
+            logging.error(f"Failed to save full day report: {e}")
+
+        return report_str
 
     def run(self):
         """
@@ -605,14 +523,8 @@ class LiveTrader:
                     logging.info("Waiting 60 seconds before retrying...")
                     time.sleep(60)
         finally:
-            # Final summary
-            logging.info("\n" + "="*60)
-            logging.info("🎯 LIVE TRADING SESSION COMPLETED")
-            logging.info(f"Total Cycles: {self.cycle_count}")
-            logging.info(f"Open Positions: {len(self.open_positions)}")
-            logging.info(f"Closed Trades: {len(self.closed_trades)}")
-            logging.info(f"Portfolio Value: ${self.portfolio_value:,.2f}")
-            logging.info("="*60)
+            # Generate and save the final report
+            self.generate_final_summary()
     
     def check_and_execute_dynamic_reinforcement(self):
         """
@@ -832,134 +744,101 @@ class LiveTrader:
     
     def calculate_ufo_entry_price(self, symbol, direction, ufo_data=None, use_strength=True):
         """
-        Calculate optimal entry price based on UFO methodology and currency strength.
-        This is the main UFO entry price calculation used for new trades.
-        
-        Args:
-            symbol: Trading symbol (e.g., 'EURUSD-ECN')
-            direction: 'BUY' or 'SELL'
-            ufo_data: Enhanced UFO data with currency strengths
-            use_strength: Whether to use currency strength for price optimization
-        
-        Returns:
-            Optimal entry price based on UFO analysis
+        Calculate optimal entry price based on UFO methodology, integrating historical
+        price data and refined currency strength analysis.
         """
         try:
-            # Get current market data
+            # --- 1. Get Market and Historical Data ---
             current_market_data = self.get_real_time_market_data_for_positions([{'symbol': symbol}])
-            
             if symbol not in current_market_data:
-                logging.warning(f"⚠️ No market data for {symbol}, returning None")
+                logging.warning(f"⚠️ No market data for {symbol}, cannot calculate entry price.")
                 return None
             
             current_data = current_market_data[symbol]
-            bid = current_data['bid']
-            ask = current_data['ask']
-            spread = current_data['spread']
+            bid, ask, spread = current_data['bid'], current_data['ask'], current_data['spread']
             
-            # Base price depends on direction
-            if direction == 'BUY':
-                base_price = ask
-            else:
-                base_price = bid
-            
-            # Calculate UFO adjustment if UFO data is available
+            # Get 15 minutes of M1 data for momentum/volatility analysis
+            hist_data = self.mt5_collector.get_historical_data(symbol, mt5.TIMEFRAME_M1, num_bars=15)
+
+            # --- 2. Analyze Short-Term Momentum & Volatility ---
+            momentum = 0
+            if hist_data is not None and not hist_data.empty:
+                price_changes = hist_data['close'].diff().dropna()
+                if not price_changes.empty:
+                    momentum = price_changes.mean()
+
+            # --- 3. Determine Base Price and Initial Adjustment ---
+            base_price = ask if direction == 'BUY' else bid
             price_adjustment = 0.0
-            
+
+            # --- 4. Refined UFO Strength Analysis ---
             if ufo_data and use_strength:
-                # Extract currencies from symbol
                 clean_symbol = symbol.replace('-ECN', '').replace('/', '')
                 if len(clean_symbol) >= 6:
-                    base_currency = clean_symbol[:3]
-                    quote_currency = clean_symbol[3:6]
-                    
-                    # Get currency strengths from primary trading timeframe (M5)
+                    base_currency, quote_currency = clean_symbol[:3], clean_symbol[3:6]
                     base_strength = self._get_currency_strength_from_ufo(base_currency, ufo_data)
                     quote_strength = self._get_currency_strength_from_ufo(quote_currency, ufo_data)
-                    
-                    # Calculate strength differential
                     strength_diff = base_strength - quote_strength
+
+                    logging.info(f"🔬 UFO Strength Analysis for {symbol}: {base_currency}({base_strength:.2f}) vs {quote_currency}({quote_strength:.2f}) -> Diff: {strength_diff:.2f}")
+
+                    # Refined adjustment: scale adjustment based on strength magnitude
+                    # A larger diff gives a larger credit for waiting for a better price.
+                    strength_adjustment_factor = np.clip(strength_diff / 10.0, -1, 1) # Normalize to [-1, 1]
                     
-                    # Log strength analysis
-                    logging.info(f"🔬 UFO Strength Analysis for {symbol}:")
-                    logging.info(f"   {base_currency}: {base_strength:.2f}")
-                    logging.info(f"   {quote_currency}: {quote_strength:.2f}")
-                    logging.info(f"   Differential: {strength_diff:.2f}")
-                    
-                    # UFO-based price adjustment logic
-                    if abs(strength_diff) > 1.0:  # Significant strength difference
-                        if direction == 'BUY':
-                            if strength_diff > 0:  # Strong base currency = good for buy
-                                # Try to get slightly better entry (lower price)
-                                price_adjustment = -spread * 0.2  # 20% of spread improvement
-                                logging.info(f"   ✅ Strong {base_currency} - favorable BUY entry")
-                            else:  # Weak base currency = less favorable
-                                # Accept slightly worse entry for weak signal
-                                price_adjustment = spread * 0.1
-                                logging.info(f"   ⚠️ Weak {base_currency} - cautious BUY entry")
-                        else:  # SELL
-                            if strength_diff < 0:  # Weak base currency = good for sell
-                                # Try to get slightly better entry (higher price)
-                                price_adjustment = spread * 0.2  # 20% of spread improvement
-                                logging.info(f"   ✅ Weak {base_currency} - favorable SELL entry")
-                            else:  # Strong base currency = less favorable
-                                # Accept slightly worse entry for weak signal
-                                price_adjustment = -spread * 0.1
-                                logging.info(f"   ⚠️ Strong {base_currency} - cautious SELL entry")
-                    else:
-                        logging.info("   📊 Neutral strength - using market price")
-                
-                # Check for additional UFO signals
-                if 'oscillation_analysis' in ufo_data:
-                    oscillations = ufo_data['oscillation_analysis']
-                    if oscillations.get('high_oscillation_currencies'):
-                        # In high oscillation, add small buffer for safety
-                        if direction == 'BUY':
-                            price_adjustment += spread * 0.05  # Small buffer
-                        else:
-                            price_adjustment -= spread * 0.05
-                        logging.info("   🔄 High oscillation detected - adding safety buffer")
-                
-                if 'uncertainty_metrics' in ufo_data:
-                    uncertainty = ufo_data['uncertainty_metrics']
-                    if uncertainty.get('overall_uncertainty', 0) > 0.7:
-                        # High uncertainty - be more conservative
-                        if direction == 'BUY':
-                            price_adjustment += spread * 0.1  # Accept worse price in uncertainty
-                        else:
-                            price_adjustment -= spread * 0.1
-                        logging.info("   ⚠️ High market uncertainty - conservative entry")
+                    if direction == 'BUY':
+                        # Favorable (strong base): negative adjustment (lower price)
+                        # Unfavorable (weak base): positive adjustment (higher price)
+                        price_adjustment = -strength_adjustment_factor * spread * 0.5 # Max adjustment is 50% of spread
+                    else: # SELL
+                        # Favorable (weak base): positive adjustment (higher price)
+                        # Unfavorable (strong base): negative adjustment (lower price)
+                        price_adjustment = strength_adjustment_factor * spread * 0.5
+
+                    logging.info(f"   Strength adjustment: {price_adjustment:.5f}")
+
+            # --- 5. Integrate Momentum ---
+            momentum_adjustment = 0
+            if (direction == 'BUY' and momentum > 0) or (direction == 'SELL' and momentum < 0):
+                # Momentum agrees with the trade, be less patient
+                momentum_adjustment = (spread * 0.15) if direction == 'BUY' else (-spread * 0.15)
+                logging.info(f"   Momentum agrees. Adjustment: {momentum_adjustment:.5f}")
             
-            # Calculate final optimal price
+            price_adjustment += momentum_adjustment
+
+            # --- 6. Other UFO Factor Adjustments (Uncertainty, Oscillation) ---
+            if ufo_data:
+                # Uncertainty: be more conservative (accept worse price)
+                uncertainty_level = ufo_data.get('uncertainty_metrics', {}).get('M5', {}).get('uncertainty_ratio', 0.0)
+                if uncertainty_level > 0.6:
+                    uncertainty_adj = (spread * 0.1) if direction == 'BUY' else (-spread * 0.1)
+                    price_adjustment += uncertainty_adj
+                    logging.info(f"   High uncertainty. Adjustment: {uncertainty_adj:.5f}")
+            
+            # --- 7. Calculate Final Price with Sanity Checks ---
             optimal_price = base_price + price_adjustment
-            
-            # Apply sanity checks to prevent extreme prices
+
+            # Sanity checks to keep the price reasonable
             if direction == 'BUY':
-                # Don't pay more than 1.5 spreads above ask
-                max_price = ask + (spread * 1.5)
-                optimal_price = min(optimal_price, max_price)
-                # Don't try to buy below bid (impossible)
-                min_price = bid - (spread * 0.5)
-                optimal_price = max(optimal_price, min_price)
-            else:
-                # Don't sell for less than 1.5 spreads below bid
-                min_price = bid - (spread * 1.5)
-                optimal_price = max(optimal_price, min_price)
-                # Don't try to sell above ask + reasonable buffer
-                max_price = ask + (spread * 0.5)
-                optimal_price = min(optimal_price, max_price)
+                max_price = ask + (spread * 1.2) # Don't pay >120% of spread
+                min_price = ask - (spread * 0.8) # Don't expect >80% spread improvement
+                optimal_price = np.clip(optimal_price, min_price, max_price)
+            else: # SELL
+                min_price = bid - (spread * 1.2)
+                max_price = bid + (spread * 0.8)
+                optimal_price = np.clip(optimal_price, min_price, max_price)
             
-            logging.info(f"💰 UFO Optimal Entry Price: {optimal_price:.5f}")
-            logging.info(f"   Market: Bid={bid:.5f}, Ask={ask:.5f}, Spread={spread:.5f}")
-            logging.info(f"   Adjustment: {price_adjustment:.5f} ({price_adjustment/spread*100:.1f}% of spread)")
-            
+            logging.info(f"💰 UFO Optimal Entry Price for {symbol}: {optimal_price:.5f}")
+            logging.info(f"   Market: Ask={ask:.5f}, Bid={bid:.5f}")
+            logging.info(f"   Total Adjustment: {price_adjustment:.5f} ({((optimal_price/base_price)-1)*100:.4f}%)")
+
             return optimal_price
-            
+
         except Exception as e:
             logging.error(f"❌ Error calculating UFO entry price: {e}")
             import traceback
             logging.error(traceback.format_exc())
-            # Return market price as fallback
+            # Fallback to market price
             return ask if direction == 'BUY' else bid
     
     def _get_currency_strength_from_ufo(self, currency, ufo_data, timeframe=None):

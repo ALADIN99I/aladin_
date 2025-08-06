@@ -10,6 +10,24 @@ class UfoCalculator:
         self.mean_reversion_threshold = 2.0  # Standard deviations for mean reversion
         self.trend_coherence_threshold = 0.7  # Correlation threshold for trend coherence
 
+    def get_pip_value_multiplier(self, currency_pair):
+        """
+        Determines the pip value multiplier for a given currency pair.
+        JPY pairs have a different pip location than most other pairs.
+        """
+        if not isinstance(currency_pair, str) or len(currency_pair) < 6:
+            print(f"Warning: Invalid currency_pair format '{currency_pair}' for pip value calculation. Defaulting to 10000.")
+            return 10000
+
+        currency_pair = currency_pair.upper()
+
+        if "JPY" in currency_pair:
+            return 100
+
+        # For most pairs, a pip is 0.0001. Multiplier is 1/0.0001 = 10000
+        # For JPY pairs, a pip is 0.01. Multiplier is 1/0.01 = 100
+        return 10000
+
     def calculate_percentage_variation(self, price_data):
         """
         Calculates the percentage variation for each currency cross.

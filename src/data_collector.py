@@ -1,4 +1,6 @@
 import pandas as pd
+import datetime
+import pytz
 try:
     import MetaTrader5 as mt5
 except ImportError:
@@ -77,6 +79,64 @@ class MT5DataCollector:
             return None  # No new bar yet
 
         return rates_df
+
+    def get_historical_price_for_time(self, symbol, target_time, timeframe=mt5.TIMEFRAME_M1):
+        """
+        Fetches the historical bar data for a symbol at a specific time.
+        Includes a fallback mechanism to find the closest available data point.
+        """
+        if not isinstance(target_time, datetime.datetime):
+            # Try to convert if it's a string
+            try:
+                target_time = pd.to_datetime(target_time).to_pydatetime()
+            except ValueError:
+                raise ValueError("target_time must be a datetime object or a convertible string")
+
+        # Ensure target_time is timezone-aware (UTC)
+        if target_time.tzinfo is None:
+            target_time = pytz.utc.localize(target_time)
+        else:
+            target_time = target_time.astimezone(pytz.utc)
+
+        # Convert target_time to a timestamp for the request
+        timestamp = int(target_time.timestamp())
+
+        # Attempt to fetch the exact bar for the given time from MT5
+        # We request 2 bars to check if the returned bar is the exact one
+        rates = mt5.copy_rates_from(symbol, timeframe, timestamp, 2)
+
+        if rates is None or len(rates) == 0:
+            print(f"No historical data found for {symbol} near {target_time}.")
+            return None
+
+        # Convert to DataFrame
+        rates_df = pd.DataFrame(rates)
+        rates_df['time'] = pd.to_datetime(rates_df['time'], unit='s', utc=True)
+
+        # Find the bar right before or at the target time
+        # We use searchsorted to find the index where the target_time would be inserted
+        # to maintain order. The item at index-1 is the one we want.
+        insert_pos = rates_df['time'].searchsorted(target_time, side='right')
+
+        if insert_pos == 0:
+            # This means all fetched bars are after the target_time, which can happen
+            # if there's a gap in data. We should search backwards.
+            print(f"No data found at or before {target_time} for {symbol}. All fetched bars are newer.")
+            # Let's try fetching a range before the timestamp
+            rates_before = mt5.copy_rates_range(symbol, timeframe, timestamp - 3600, timestamp) # 1 hour before
+            if rates_before is None or len(rates_before) == 0:
+                print(f"Fallback search failed for {symbol} before {target_time}")
+                return None
+
+            rates_df = pd.DataFrame(rates_before)
+            rates_df['time'] = pd.to_datetime(rates_df['time'], unit='s', utc=True)
+            return rates_df.iloc[-1:].copy()
+
+
+        # The bar we want is at the position before the insertion point
+        closest_bar = rates_df.iloc[insert_pos - 1:insert_pos].copy()
+
+        return closest_bar
     
     def get_daily_ufo_data(self, symbol, timeframe=None):
         """

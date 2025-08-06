@@ -6,9 +6,9 @@ from datetime import datetime, timedelta
 import warnings
 
 class RiskManagerAgent(Agent):
-    def __init__(self, name, llm_client, mt5_connection, config):
+    def __init__(self, name, llm_client, mt5_connection, config, portfolio_manager):
         super().__init__(name, llm_client)
-        self.portfolio_manager = PortfolioManager(mt5_connection)
+        self.portfolio_manager = portfolio_manager
         # Read portfolio stop from config, same as UFOTradingEngine
         portfolio_stop_raw = config['trading'].get('portfolio_equity_stop', '-5.0')
         # Handle config values with inline comments like '-5.0 (-3.0)'
