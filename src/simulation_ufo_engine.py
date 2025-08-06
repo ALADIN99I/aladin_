@@ -15,8 +15,8 @@ class SimulationUFOTradingEngine(UFOTradingEngine):
     This allows proper testing of historical dates and scenarios
     """
     
-    def __init__(self, config, simulation_time=None):
-        super().__init__(config)
+    def __init__(self, config, ufo_calculator, simulation_time=None):
+        super().__init__(config, ufo_calculator)
         self.simulation_time = simulation_time
         
     def set_simulation_time(self, simulation_time):

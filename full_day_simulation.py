@@ -79,6 +79,14 @@ class FullDayTradingSimulation:
         self.max_concurrent_positions = parse_value(self.config['trading'].get('max_concurrent_positions', '11'), 11)
         self.target_positions_when_available = parse_value(self.config['trading'].get('target_positions_when_available', '6'), 6)
         self.min_positions_for_session = parse_value(self.config['trading'].get('min_positions_for_session', '5'), 5)
+
+        # Standardize portfolio management rules from config
+        self.profit_target = parse_value(self.config['trading'].get('profit_target', '75.0'), 75.0)
+        self.stop_loss = parse_value(self.config['trading'].get('stop_loss', '-50.0'), -50.0)
+        self.max_position_duration_hours = parse_value(self.config['trading'].get('max_position_duration_hours', '4'), 4)
+        self.enable_trailing_stop = self.config['trading'].getboolean('enable_trailing_stop', True)
+        self.trailing_stop_trigger_pnl = parse_value(self.config['trading'].get('trailing_stop_trigger_pnl', '30.0'), 30.0)
+        self.trailing_stop_distance_pnl = parse_value(self.config['trading'].get('trailing_stop_distance_pnl', '15.0'), 15.0)
     
     def initialize_components(self):
         """Initialize all trading components"""
@@ -101,7 +109,7 @@ class FullDayTradingSimulation:
         
         # Initialize UFO components
         self.ufo_calculator = UfoCalculator(self.config['trading']['currencies'].split(','))
-        self.ufo_engine = SimulationUFOTradingEngine(self.config, self.simulation_date)
+        self.ufo_engine = SimulationUFOTradingEngine(self.config, self.ufo_calculator, self.simulation_date)
         
         # Initialize agents
         symbols_list = self.config['trading']['symbols'].split(',')
@@ -240,25 +248,29 @@ class FullDayTradingSimulation:
         # Close positions based on realistic conditions (stop loss, take profit)
         positions_to_close = []
         for i, position in enumerate(self.open_positions):
-            # Enhanced position closing logic with proper thresholds
-            close_on_profit = position['pnl'] > 75  # Take profit at +$75
-            close_on_loss = position['pnl'] < -50   # Stop loss at -$50
+            # Enhanced position closing logic with proper thresholds from config
+            close_on_profit = position['pnl'] > self.profit_target
+            close_on_loss = position['pnl'] < self.stop_loss
             
-            # Time-based exit: close positions older than 4 hours (240 minutes)
+            # Time-based exit: close positions older than max_position_duration_hours
             close_on_time = False
             if current_time and 'timestamp' in position:
-                position_age = (current_time - position['timestamp']).total_seconds() / 60
-                close_on_time = position_age > 240  # 4 hours
+                position_age_hours = (current_time - position['timestamp']).total_seconds() / 3600
+                close_on_time = position_age_hours > self.max_position_duration_hours
             
-            # Trailing stop: close if position has moved against us significantly from peak
+            # Trailing stop logic aligned with PortfolioManager
             close_on_trailing = False
-            if 'peak_pnl' not in position:
-                position['peak_pnl'] = position['pnl']
-            elif position['pnl'] > position['peak_pnl']:
-                position['peak_pnl'] = position['pnl']
-            elif position['peak_pnl'] > 30 and position['pnl'] < position['peak_pnl'] * 0.7:
-                close_on_trailing = True
-            
+            if self.enable_trailing_stop:
+                if 'peak_pnl' not in position:
+                    position['peak_pnl'] = position['pnl']
+                elif position['pnl'] > position['peak_pnl']:
+                    position['peak_pnl'] = position['pnl']
+
+                if position.get('peak_pnl', 0) >= self.trailing_stop_trigger_pnl:
+                    trailing_stop_level = position['peak_pnl'] - self.trailing_stop_distance_pnl
+                    if position['pnl'] <= trailing_stop_level:
+                        close_on_trailing = True
+
             if close_on_profit or close_on_loss or close_on_time or close_on_trailing:
                 positions_to_close.append(i)
                 if close_on_profit:
